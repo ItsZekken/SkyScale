@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SkyScale — El Cielo y la Curvatura de la Tierra a Escala Real</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <!-- Loading Overlay -->
+  <div id="loading-overlay" style="position:fixed;inset:0;z-index:9999;background:#060913;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;transition:opacity 0.4s ease;">
+    <div style="font-size:24px;font-weight:800;color:#fff;letter-spacing:-0.02em;">SkyScale <span style="font-family:monospace;font-size:12px;color:#38bdf8;background:rgba(56,189,248,0.15);padding:3px 8px;border-radius:99px;">v2 GPU</span></div>
+    <div style="width:280px;height:6px;background:rgba(255,255,255,0.12);border-radius:99px;overflow:hidden;">
+      <div id="loading-bar" style="width:0%;height:100%;background:linear-gradient(90deg,#38bdf8,#0284c7);transition:width 0.15s ease;"></div>
+    </div>
+    <div id="loading-status" style="font-family:monospace;font-size:12px;color:#94a3b8;">Iniciando shaders atmosféricos... (0%)</div>
+  </div>
+
+  <div id="canvas-container"></div>
+
+  <!-- Top Header with 4-State Time of Day Toggle -->
+  <header class="app-header">
+    <div class="brand">
+      <h1>SkyScale</h1>
+      <span class="brand-badge">R = 6,371 km</span>
+    </div>
+
+    <div class="time-selector">
+      <button class="time-btn" data-time="sunrise" title="Amanecer (Luz dorada matutina)">🌅 Amanecer</button>
+      <button class="time-btn active" data-time="noon" title="Mediodía (Sol cenital brillante)">☀️ Mediodía</button>
+      <button class="time-btn" data-time="sunset" title="Atardecer (Cielo caribeño encendido)">🌇 Atardecer</button>
+      <button class="time-btn" data-time="midnight" title="Medianoche (Noche estrellada y relámpagos)">🌌 Medianoche</button>
+    </div>
+
+    <button id="sound-btn" class="icon-btn" title="Activar/Silenciar sonido atmosférico">
+      <span class="sound-icon">🔇</span>
+    </button>
+  </header>
+
+  <!-- Sprite Flash Notification Alert Overlay -->
+  <div id="sprite-alert" class="sprite-alert hidden">
+    ⚡ ¡RED SPRITE DETECTADO EN LA MESOSFERA (80 KM)!
+  </div>
+
+  <!-- Floating Educational Story Card (Left) -->
+  <article id="station-card" class="station-card">
+    <div class="card-badge" id="card-badge">Curvatura oculta: ~987 m</div>
+    <h3 id="card-title">El Engaño de la Perspectiva</h3>
+    <div class="card-metric" id="card-metric">Altitud: 25 m • Horizonte a 17.8 km</div>
+    <p id="card-description">
+      Desde la costa en Barranquilla, la curvatura terrestre oculta casi 1 km de la base de la tormenta y la perspectiva la aplana contra el cielo como si fuera un telón pintado.
+    </p>
+    <div class="card-actions">
+      <button id="card-prev-btn" class="card-nav-btn">◀ Anterior</button>
+      <button id="card-next-btn" class="card-action-btn">Subir de Capa ▶</button>
+    </div>
+  </article>
+
+  <!-- Live Real-Scale Dimensions HUD (Right - neal.fun style) -->
+  <aside id="scale-hud" class="scale-hud">
+    <div class="hud-header">
+      <span class="hud-tag">DIMENSIONES REALES 3D</span>
+      <h2 id="hud-title">Supercelda Tropical</h2>
+    </div>
+    <div class="hud-metrics-grid">
+      <div class="hud-metric-card">
+        <span class="metric-label">Altura Cima</span>
+        <strong class="metric-value" id="hud-height">16.5 km</strong>
+        <span class="metric-sub">1.9x Monte Everest</span>
+      </div>
+      <div class="hud-metric-card">
+        <span class="metric-label">Ancho Yunque</span>
+        <strong class="metric-value" id="hud-width">72.0 km</strong>
+        <span class="metric-sub">Barranquilla → Ciénaga</span>
+      </div>
+      <div class="hud-metric-card">
+        <span class="metric-label">Volumen</span>
+        <strong class="metric-value" id="hud-volume">5,420 km³</strong>
+        <span class="metric-sub">Vapor y hielo</span>
+      </div>
+      <div class="hud-metric-card">
+        <span class="metric-label">Masa de Agua</span>
+        <strong class="metric-value" id="hud-water">5.4 Mt</strong>
+        <span class="metric-sub">5.4 millones de ton</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Perspective Shift Stations Navigation -->
+  <nav class="perspective-stations-bar" aria-label="Estaciones de altitud">
+    <div class="stations-pills-wrapper">
+      <button class="station-pill active" data-station="0">
+        <span class="pill-alt">25 m</span>
+        <span class="pill-name">Mirador Costa</span>
+      </button>
+      <button class="station-pill" data-station="1">
+        <span class="pill-alt">1.8 km</span>
+        <span class="pill-name">Base LCL</span>
+      </button>
+      <button class="station-pill" data-station="2">
+        <span class="pill-alt">11.0 km</span>
+        <span class="pill-name">Vuelo Crucero</span>
+      </button>
+      <button class="station-pill" data-station="3">
+        <span class="pill-alt">16.5 km</span>
+        <span class="pill-name">Yunque Incus</span>
+      </button>
+      <button class="station-pill" data-station="4">
+        <span class="pill-alt">75.0 km</span>
+        <span class="pill-name">Red Sprites</span>
+      </button>
+    </div>
+  </nav>
+
+  <!-- Bottom Floating Control Bar -->
+  <footer class="floating-controls">
+    <div class="pill-group">
+      <button id="view-ground" class="control-btn active" title="Cámara en primera persona desde el mirador">👁️ Costa (POV)</button>
+      <button id="view-fly" class="control-btn" title="Volar a órbita para ver dimensiones 3D">🚀 Escala Real 3D</button>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="sprite-action-group">
+      <button id="trigger-sprite-btn" class="action-sprite-btn" title="Dispara un rayo nube-tierra y un Red Sprite en la mesosfera">
+        <span class="bolt-icon">⚡</span>
+        <span>Disparar Sprite</span>
+      </button>
+      <button id="slowmo-toggle-btn" class="slowmo-btn" title="Alternar cámara lenta (0.1x) o tiempo real (1x)">
+        <span id="slowmo-icon">⏱️</span>
+        <span id="slowmo-text">1x</span>
+      </button>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="slider-item">
+      <div class="slider-title">
+        <span>Altitud</span>
+        <strong id="slider-alt-val">25 m</strong>
+      </div>
+      <input type="range" id="alt-slider" min="0" max="100" value="0.05" step="0.05">
+    </div>
+
+    <div class="slider-item">
+      <div class="slider-title">
+        <span>Distancia</span>
+        <strong id="slider-dist-val">130 km</strong>
+      </div>
+      <input type="range" id="dist-slider" min="50" max="250" value="130" step="1">
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="curvature-badge" title="Metros de la base de la nube ocultos tras el horizonte">
+      <span class="badge-label">Curvatura Oculta</span>
+      <strong id="val-hidden-meters" class="badge-val">987 m</strong>
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="pill-group">
+      <button class="icon-toggle active" data-ref="plane" title="Avión comercial (11 km)">✈️</button>
+      <button class="icon-toggle active" data-ref="everest" title="Monte Everest (8.8 km)">🏔️</button>
+      <button class="icon-toggle active" data-ref="burj" title="Burj Khalifa (828 m)">🏢</button>
+    </div>
+  </footer>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>
