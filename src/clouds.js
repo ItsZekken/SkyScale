@@ -24,6 +24,7 @@ export function createRealisticClouds(initialDistKm = 130, bakes = null) {
   group.name = 'photorealistic-clouds-system';
 
   const texAtlas = (bakes && bakes.cloudAtlas) ? bakes.cloudAtlas : generateVolumetricCloudTexture();
+  const texNoiseAtlas = (bakes && bakes.noiseAtlas) ? bakes.noiseAtlas : texAtlas;
   const texCirrus = (bakes && bakes.cirrus) ? bakes.cirrus : generateCirrusTexture();
 
   const flashPositions = [
@@ -37,6 +38,7 @@ export function createRealisticClouds(initialDistKm = 130, bakes = null) {
   const cloudUniforms = {
     ...atmosphereUniforms,
     uAtlas: { value: texAtlas },
+    uNoiseAtlas: { value: texNoiseAtlas },
     uCirrus: { value: texCirrus },
     uSunPosition: atmosphereUniforms.uSunDir,
     uStormDistKm: { value: initialDistKm },
@@ -48,9 +50,9 @@ export function createRealisticClouds(initialDistKm = 130, bakes = null) {
   };
 
   // =========================================================================
-  // 1. VOLUMETRIC 3D CLOUD SHELL (RAYMARCHING ENGINE)
+  // 1. VOLUMETRIC 3D CLOUD SHELL (60 FPS BOUNDED RAYMARCHING ENGINE)
   // =========================================================================
-  const shellGeo = new THREE.SphereGeometry(EARTH_RADIUS + 18.5, 96, 64);
+  const shellGeo = new THREE.SphereGeometry(EARTH_RADIUS + 18.0, 96, 64);
 
   const cloudMat = new THREE.ShaderMaterial({
     uniforms: cloudUniforms,
@@ -78,6 +80,7 @@ export function createRealisticClouds(initialDistKm = 130, bakes = null) {
       #endif
 
       uniform sampler2D uAtlas;
+      uniform sampler2D uNoiseAtlas;
       uniform sampler2D uCirrus;
       uniform float uStormDistKm;
       uniform float uStormFlash;
@@ -91,36 +94,30 @@ export function createRealisticClouds(initialDistKm = 130, bakes = null) {
       ${ATMOSPHERE_CONSTANTS_GLSL}
       ${ATMOSPHERE_GLSL}
 
-      const float R_BASE = 6371.0 + 1.25;  // Cloud layer base: 1250 m
-      const float R_TOP  = 6371.0 + 17.5;  // Cloud layer top: 17500 m
+      const float R_BASE     = 6371.0 + 1.35;  // Marine LCL cloud base: 1350 m
+      const float R_REG_TOP  = 6371.0 + 5.20;  // Regional trade-wind cumulus top: 5200 m
+      const float R_TOP      = 6371.0 + 17.20; // Supercell overshooting top: 17200 m
 
-      // Fast Interleaved Gradient Noise for sub-pixel ray jittering (eliminates banding)
+      // Interleaved Gradient Noise for sub-pixel ray jittering
       float ign(vec2 p) {
         vec3 magic = vec3(0.06711056, 0.00583715, 52.9829189);
         return fract(magic.z * fract(dot(p, magic.xy)));
       }
 
-      // Fast 3D Value Noise for cloud cauliflower billow sculpting
-      float hash13(vec3 p3) {
-        p3 = fract(p3 * 0.1031);
-        p3 += dot(p3, p3.zyx + 31.32);
-        return fract((p3.x + p3.y) * p3.z);
-      }
-
-      float vnoise3(vec3 p) {
-        vec3 i = floor(p);
-        vec3 f = fract(p);
-        vec3 u = f * f * (3.0 - 2.0 * f);
-        float n000 = hash13(i);
-        float n100 = hash13(i + vec3(1.0, 0.0, 0.0));
-        float n010 = hash13(i + vec3(0.0, 1.0, 0.0));
-        float n110 = hash13(i + vec3(1.0, 1.0, 0.0));
-        float n001 = hash13(i + vec3(0.0, 0.0, 1.0));
-        float n101 = hash13(i + vec3(1.0, 0.0, 1.0));
-        float n011 = hash13(i + vec3(0.0, 1.0, 1.0));
-        float n111 = hash13(i + vec3(1.0, 1.0, 1.0));
-        return mix(mix(mix(n000, n100, u.x), mix(n010, n110, u.x), u.y),
-                   mix(mix(n001, n101, u.x), mix(n011, n111, u.x), u.y), u.z);
+      // Trilinear Hardware 3D Volume Noise Atlas Lookup (64^3 packed in 8x8 slices of 512x512)
+      // Eliminates Z-slice terracing and replaces 40 ALU hash ops with 2 hardware 2D fetches!
+      vec4 sampleNoise3D(vec3 p) {
+        vec3 uvw = fract(p);
+        float z = uvw.z * 64.0;
+        float z0 = floor(z);
+        float z1 = mod(z0 + 1.0, 64.0);
+        float fz = fract(z);
+        vec2 xy = uvw.xy * 63.0 + 0.5;
+        vec2 slice0 = vec2(mod(z0, 8.0), floor(z0 * 0.125));
+        vec2 slice1 = vec2(mod(z1, 8.0), floor(z1 * 0.125));
+        vec2 uv0 = (slice0 * 64.0 + xy) * (1.0 / 512.0);
+        vec2 uv1 = (slice1 * 64.0 + xy) * (1.0 / 512.0);
+        return mix(texture2D(uNoiseAtlas, uv0), texture2D(uNoiseAtlas, uv1), fz);
       }
 
       // Analytical Ray-Sphere intersection
@@ -133,174 +130,192 @@ export function createRealisticClouds(initialDistKm = 130, bakes = null) {
         return vec2(-b - s, -b + s);
       }
 
-      // 1. Organic Multi-Lobe Cumulonimbus Supercell Macro Geometry
+      // 1. Organic Multi-Turret Cumulonimbus Supercell Macro Geometry
       float evalSupercell(float dx, float dz, float h) {
-        // Main updraft complex: multiple interpenetrating convective domes
-        float ax = 0.05 * pow(max(0.0, h - 3.0), 1.55);
-        
-        // Updraft Core 1: Central convective column
-        float r1 = length(vec2(dx - ax, dz));
-        float rTower1 = mix(8.8, 5.0, clamp((h - 2.2) / 11.0, 0.0, 1.0));
-        float d1 = clamp(1.0 - (r1 - rTower1) / 3.4, 0.0, 1.0)
-                 * smoothstep(1.5, 2.4, h) * smoothstep(15.0, 13.0, h);
+        // Wind shear leans the upper updraft and anvil eastward (+X) and northward (-Z)
+        float shearX = 0.048 * pow(max(0.0, h - 2.5), 1.55);
+        float shearZ = 0.018 * pow(max(0.0, h - 4.0), 1.45);
+        vec3 q = vec3(dx - shearX, h, dz - shearZ);
 
-        // Updraft Core 2: Forward convective lobe
-        float r2 = length(vec2(dx - ax + 4.2, dz - 3.8));
-        float rTower2 = mix(7.2, 4.0, clamp((h - 2.2) / 9.8, 0.0, 1.0));
-        float d2 = clamp(1.0 - (r2 - rTower2) / 2.8, 0.0, 1.0)
-                 * smoothstep(1.6, 2.4, h) * smoothstep(13.8, 12.0, h);
+        // Central updraft column + 3D boiling spherical convective turrets along altitude
+        float rMain = length(q.xz);
+        float rCol  = mix(8.2, 5.2, clamp((h - 2.0) * 0.085, 0.0, 1.0))
+                    + 1.35 * sin(h * 1.15) * smoothstep(2.5, 12.5, h);
+        float dMain = smoothstep(rCol + 3.2, rCol - 2.4, rMain)
+                    * smoothstep(1.45, 2.25, h) * smoothstep(15.2, 12.8, h);
 
-        // Updraft Core 3: Rear convective flank
-        float r3 = length(vec2(dx - ax - 4.8, dz + 3.6));
-        float rTower3 = mix(6.8, 3.8, clamp((h - 2.2) / 8.8, 0.0, 1.0));
-        float d3 = clamp(1.0 - (r3 - rTower3) / 2.7, 0.0, 1.0)
-                 * smoothstep(1.6, 2.4, h) * smoothstep(13.0, 11.4, h);
+        // 3D Spherical Convective Turrets (boiling cauliflower domes around the main core)
+        float dTurrets = 0.0;
+        dTurrets = max(dTurrets, smoothstep(5.8, 1.8, length(vec3(q.x - 4.8, (h - 6.2) * 1.15, q.z + 3.4))));
+        dTurrets = max(dTurrets, smoothstep(6.2, 2.0, length(vec3(q.x + 5.2, (h - 8.4) * 1.10, q.z - 3.6))));
+        dTurrets = max(dTurrets, smoothstep(5.6, 1.8, length(vec3(q.x - 3.6, (h - 10.6) * 1.15, q.z - 4.2))));
+        dTurrets = max(dTurrets, smoothstep(6.0, 2.0, length(vec3(q.x + 4.4, (h - 11.8) * 1.20, q.z + 3.2))));
+        dTurrets = max(dTurrets, smoothstep(5.2, 1.6, length(vec3(q.x - 7.5, (h - 4.8) * 1.25, q.z - 1.5))));
+        dTurrets = max(dTurrets, smoothstep(5.4, 1.7, length(vec3(q.x + 7.8, (h - 5.6) * 1.20, q.z + 2.4))));
 
-        // Updraft Core 4: Eastern bubbling dome
-        float r4 = length(vec2(dx - ax + 7.2, dz + 1.4));
-        float rTower4 = mix(6.0, 3.4, clamp((h - 2.2) / 7.8, 0.0, 1.0));
-        float d4 = clamp(1.0 - (r4 - rTower4) / 2.6, 0.0, 1.0)
-                 * smoothstep(1.6, 2.4, h) * smoothstep(12.2, 10.5, h);
-
-        float densTowers = max(d1, max(d2, max(d3, d4)));
-
-        // 5 Flanking Feeder Towers (Cumulus congestus staircase)
-        float densFeeders = 0.0;
-        {
-          float rf = length(vec2(dx - (-16.0), dz - 3.0));
-          float rLim = mix(5.0, 2.5, clamp((h - 2.2) / 7.0, 0.0, 1.0));
-          float d = clamp(1.0 - (rf - rLim) / 2.2, 0.0, 1.0) * smoothstep(1.6, 2.4, h) * smoothstep(10.0, 9.0, h);
-          densFeeders = max(densFeeders, d);
-        }
-        {
-          float rf = length(vec2(dx - (-23.0), dz - (-2.0)));
-          float rLim = mix(4.5, 2.2, clamp((h - 2.2) / 5.0, 0.0, 1.0));
-          float d = clamp(1.0 - (rf - rLim) / 2.0, 0.0, 1.0) * smoothstep(1.6, 2.3, h) * smoothstep(8.0, 7.0, h);
-          densFeeders = max(densFeeders, d);
-        }
-        {
-          float rf = length(vec2(dx - (-30.0), dz - 4.0));
-          float rLim = mix(4.0, 2.0, clamp((h - 2.2) / 3.2, 0.0, 1.0));
-          float d = clamp(1.0 - (rf - rLim) / 1.8, 0.0, 1.0) * smoothstep(1.6, 2.2, h) * smoothstep(6.0, 5.2, h);
-          densFeeders = max(densFeeders, d);
-        }
-        {
-          float rf = length(vec2(dx - 15.0, dz - (-2.0)));
-          float rLim = mix(4.6, 2.3, clamp((h - 2.2) / 6.2, 0.0, 1.0));
-          float d = clamp(1.0 - (rf - rLim) / 2.0, 0.0, 1.0) * smoothstep(1.6, 2.3, h) * smoothstep(9.0, 8.0, h);
-          densFeeders = max(densFeeders, d);
-        }
-        {
-          float rf = length(vec2(dx - 22.0, dz - 2.0));
-          float rLim = mix(4.2, 2.0, clamp((h - 2.2) / 3.6, 0.0, 1.0));
-          float d = clamp(1.0 - (rf - rLim) / 1.8, 0.0, 1.0) * smoothstep(1.6, 2.2, h) * smoothstep(6.5, 5.4, h);
-          densFeeders = max(densFeeders, d);
+        // Flanking Cumulus Congestus feeder staircase (2.0 - 9.8 km)
+        float dFeeders = 0.0;
+        if (h < 10.5) {
+          dFeeders = max(dFeeders, smoothstep(5.5, 1.6, length(vec3(dx + 14.5, (h - 5.4) * 0.95, dz - 2.8))));
+          dFeeders = max(dFeeders, smoothstep(4.8, 1.4, length(vec3(dx + 21.0, (h - 4.0) * 1.10, dz + 1.8))));
+          dFeeders = max(dFeeders, smoothstep(5.2, 1.5, length(vec3(dx - 13.8, (h - 4.8) * 1.00, dz + 2.5))));
+          dFeeders = max(dFeeders, smoothstep(4.4, 1.3, length(vec3(dx - 19.5, (h - 3.5) * 1.15, dz - 2.0))));
+          dFeeders *= smoothstep(1.45, 2.15, h);
         }
 
-        // Overshooting Top Dome (14.2 -> 16.8 km)
-        vec3 otPos = vec3((dx - ax) / 4.4, (h - 14.5) / 2.4, dz / 4.4);
-        float otDist = length(otPos) - 1.0;
-        float densOT = clamp(1.0 - otDist * 1.8, 0.0, 1.0) * smoothstep(13.8, 14.6, h);
-
-        // Organic Glaciated Anvil Canopy (Incus: 11.5 - 15.6 km)
-        vec2 anvilCenter = vec2(10.0, 1.0);
-        vec2 dAnvil = vec2(dx, dz) - anvilCenter;
-        float rAnvil = length(vec2(dAnvil.x / 36.0, dAnvil.y / (20.0 * (1.0 + 0.12 * dAnvil.x / 36.0))));
-        
-        float hTop = mix(15.2, 13.2, smoothstep(0.1, 1.1, rAnvil));
-        float hBot = mix(11.8, 12.4, smoothstep(0.1, 1.1, rAnvil));
-        float vertAnvil = smoothstep(hBot - 0.8, hBot + 0.8, h) * smoothstep(hTop + 0.8, hTop - 0.8, h);
-        float horizAnvil = smoothstep(1.25, 0.35, rAnvil);
-        
-        // Mammatus pouch sagging on underside (11.2 - 12.5 km)
-        float mammatus = 0.0;
-        if (h >= 11.0 && h <= 12.6 && rAnvil < 0.85) {
-          float sag = sin(dx * 0.75) * sin(dz * 0.75) * 0.5 + 0.5;
-          mammatus = sag * smoothstep(12.6, 11.8, h) * smoothstep(11.0, 11.8, h) * 0.35;
+        // Overshooting Top Dome (13.2 -> 16.6 km)
+        float dOT = 0.0;
+        if (h > 12.8) {
+          vec3 otPos = vec3((q.x - 0.6) * 0.19, (h - 14.3) * 0.42, q.z * 0.19);
+          dOT = smoothstep(1.25, 0.25, length(otPos)) * smoothstep(13.0, 14.1, h);
         }
-        float densAnvil = (vertAnvil + mammatus) * horizAnvil * smoothstep(11.0, 12.2, h);
 
-        // Arcus Shelf & Storm Base (1.7 - 2.9 km)
-        float rBase = length(vec2(dx / 25.0, dz / 16.0));
-        float densBase = clamp(1.0 - rBase, 0.0, 1.0) * smoothstep(1.5, 1.9, h) * smoothstep(3.2, 2.4, h);
+        // Glaciated Anvil Canopy (Cumulonimbus capillatus incus: 11.2 - 15.6 km)
+        float dAnvil = 0.0;
+        if (h > 10.6) {
+          vec2 dAnv = vec2(dx - 9.5, dz - 0.8);
+          float rAnv = length(vec2(dAnv.x * 0.030, dAnv.y / (18.5 + 0.08 * max(0.0, dAnv.x))));
+          float hTop = mix(15.2, 13.4, smoothstep(0.10, 1.05, rAnv));
+          float hBot = mix(11.4, 12.5, smoothstep(0.10, 1.05, rAnv));
+          float vertAnv = smoothstep(hBot - 0.9, hBot + 0.9, h) * smoothstep(hTop + 0.85, hTop - 0.85, h);
+          float horizAnv = smoothstep(1.18, 0.22, rAnv);
+          dAnvil = vertAnv * horizAnv;
+        }
 
-        return max(densTowers, max(densFeeders, max(densOT, max(densAnvil, densBase))));
+        // Low Arcus Shelf & Rain-Cooled Outflow Base (1.45 - 3.3 km)
+        float dBase = 0.0;
+        if (h < 3.6) {
+          float rBase = length(vec2(dx * 0.042, dz * 0.058));
+          dBase = smoothstep(1.05, 0.25, rBase) * smoothstep(1.45, 1.95, h) * smoothstep(3.5, 2.3, h);
+        }
+
+        return max(max(dMain, dTurrets), max(dFeeders, max(dOT, max(dAnvil, dBase))));
       }
 
-      // 2. Regional 360° Cloud Layer from Weather Map
-      float evalRegional(vec3 pos, float h) {
-        vec2 uv = pos.xz * 0.0032 + vec2(0.5, 0.5);
+      // 2. Pre-baked Regional Caribbean Mesoscale Cloud Layer (500 km x 500 km domain)
+      float evalRegional(vec3 pos, float h, out float outTopAlt, out float outBillow) {
+        vec2 uv = pos.xz * (1.0 / 500.0) + 0.5;
         vec4 weather = texture2D(uAtlas, uv);
         float coverage = weather.r;
-        float baseAlt = weather.g * 10.0;
-        float topAlt  = weather.b * 10.0;
-        
-        if (h < baseAlt - 0.2 || h > topAlt + 0.3 || coverage < 0.12) return 0.0;
+        float baseAlt  = weather.g * 10.0;
+        float topAlt   = weather.b * 10.0;
+        outTopAlt = topAlt;
+        outBillow = weather.a;
 
-        float hNorm = (h - baseAlt) / max(0.2, topAlt - baseAlt);
-        float vertProfile = smoothstep(0.0, 0.18, hNorm) * smoothstep(1.0, 0.68, hNorm);
-        
-        return clamp((coverage - 0.22) / 0.78, 0.0, 1.0) * vertProfile;
+        if (h < baseAlt - 0.15 || h > topAlt + 0.25 || coverage < 0.14) return 0.0;
+
+        float hNorm = (h - baseAlt) / max(0.25, topAlt - baseAlt);
+        float vertProfile = smoothstep(0.0, 0.22, hNorm) * smoothstep(1.0, 0.55, hNorm);
+        return clamp((coverage - 0.15) * 1.22, 0.0, 1.0) * vertProfile;
       }
 
-      // 3. Complete Cloud Density with 3D Cauliflower Noise Modulation
-      float evalCloudDensity(vec3 pos) {
-        vec3 earthCenter = vec3(0.0, -R_EARTH, 0.0);
-        float r = length(pos - earthCenter);
-        float h = r - R_EARTH;
-        if (h < 1.15 || h > 17.2) return 0.0;
-
-        float theta = atan(-pos.z, pos.y + R_EARTH);
-        float theta0 = uStormDistKm / R_EARTH;
-        float dz = R_EARTH * (theta - theta0);
-        float dx = pos.x;
-
-        float dHoriz = sqrt(dx * dx + dz * dz);
-        float macroStorm = (dHoriz < 58.0) ? evalSupercell(dx, dz, h) : 0.0;
-        float macroRegional = evalRegional(pos, h);
-
-        float macro = max(macroStorm, macroRegional);
-        if (macro < 0.015) return 0.0;
-
-        // Smooth base condensation fade (eliminates sharp bottom shelf)
-        float baseFade = smoothstep(1.15, 1.85, h);
-        macro *= baseFade;
-
-        // Cauliflower billow noise (1.0 - abs(noise * 2.0 - 1.0))
-        vec3 pNoise = pos * 0.26 + vec3(uTime * 0.008, 0.0, uTime * 0.004);
-        if (h > 11.5) {
-          // Sheared fibrous streaks for upper glaciated ice crystals
-          pNoise = vec3(pos.x * 0.12, pos.y * 0.9, pos.z * 0.12 + pos.y * 0.25) + vec3(uTime * 0.025, 0.0, 0.0);
+      // Fast Density Evaluation for Regional-Only Rays (misses Supercell)
+      float evalRegionalDensity(vec3 pos, float h, out float outTauSun, vec3 lightDir) {
+        float topAlt, preBillow;
+        float macro = evalRegional(pos, h, topAlt, preBillow);
+        if (macro < 0.015) {
+          outTauSun = 0.0;
+          return 0.0;
+        }
+        vec3 pNoise = pos * 0.038 + vec3(uTime * 0.00014, 0.0, uTime * 0.00008);
+        vec4 nMacro = sampleNoise3D(pNoise);
+        vec4 nFine  = sampleNoise3D(pNoise * 2.3 + vec3(0.31, 0.57, 0.19));
+        float billow = mix(preBillow, nMacro.g * 0.68 + nFine.g * 0.32, 0.78);
+        float density = clamp((macro - (1.0 - billow) * 0.48) * 1.90, 0.0, 1.0);
+        if (density < 0.003) {
+          outTauSun = 0.0;
+          return 0.0;
         }
 
-        float n1 = vnoise3(pNoise);
-        float n2 = vnoise3(pNoise * 2.2 + vec3(5.1, 2.3, 3.7));
-        float billow1 = 1.0 - abs(n1 * 2.0 - 1.0);
-        float billow2 = 1.0 - abs(n2 * 2.0 - 1.0);
-        float billow = billow1 * 0.70 + billow2 * 0.30;
+        // Smooth directional Worley puff self-shadowing: bright sunlit crowns, dark bases & crevices
+        float nSun = sampleNoise3D(pNoise + lightDir * 0.12).g;
+        float creviceTau = max(0.0, nSun - nMacro.g + 0.12) * 2.6 + (1.0 - nMacro.g) * 0.45;
+        float dhTop = max(0.0, topAlt - h);
+        float baseDarkening = smoothstep(0.35, 1.85, dhTop) * 2.1;
+        outTauSun = baseDarkening + creviceTau;
+        return density;
+      }
 
-        float density = clamp((macro - (1.0 - billow) * 0.45) / 0.55, 0.0, 1.0);
+      // Full Density + Directional Cauliflower Self-Shadowing for Supercell Rays
+      float evalFullCloudDensity(vec3 pos, float h, out float outTauSun, vec3 lightDir) {
+        float dx = pos.x;
+        float dz = -pos.z - uStormDistKm;
+        float dHoriz = length(vec2(dx - 6.0, dz));
 
-        if (h > 12.0) {
-          vec2 cirrusUv = pos.xz * 0.012;
-          float cirrusVal = texture2D(uCirrus, cirrusUv).a;
-          density = mix(density, density * (0.35 + 0.65 * cirrusVal), smoothstep(12.5, 15.0, h));
+        float topAlt = 3.8, preBillow = 0.5;
+        float macroRegional = (h < 5.3) ? evalRegional(pos, h, topAlt, preBillow) : 0.0;
+        if (dHoriz >= 35.0 && macroRegional < 0.015) {
+          outTauSun = 0.0;
+          return 0.0;
+        }
+
+        vec3 pConv = pos * 0.038 + vec3(uTime * 0.00014, 0.0, uTime * 0.00008);
+        vec3 pAnv  = vec3(pos.x * 0.018, pos.y * 0.055, pos.z * 0.018 + pos.y * 0.015);
+        vec3 pNoise = mix(pConv, pAnv, smoothstep(11.4, 13.4, h));
+
+        vec4 nMacro = sampleNoise3D(pNoise);
+        vec4 nMed   = sampleNoise3D(pNoise * 2.20 + vec3(0.37, 0.61, 0.23));
+
+        // Gentle, fold-free 3D macro domain warp (strictly < 1/4 wavelength so zero speckle!)
+        float anvilMask = smoothstep(11.2, 13.5, h);
+        vec3 warp = (nMacro.rgb - 0.5) * mix(2.1, 0.7, anvilMask);
+        float macroStorm = (dHoriz < 35.0)
+          ? evalSupercell(dx + warp.x, dz + warp.z, h + warp.y * 0.45)
+          : 0.0;
+
+        float macro = max(macroStorm, macroRegional);
+        if (macro < 0.015) {
+          outTauSun = 0.0;
+          return 0.0;
+        }
+
+        float baseFade = smoothstep(1.38, 1.95, h);
+        macro *= baseFade;
+
+        float billow = nMacro.g * 0.64 + nMed.g * 0.36;
+
+        // Clean 3D Worley cauliflower carving on tower flanks, smooth fibrous glaciation on anvil
+        float erosionStrength = mix(0.56, 0.34, anvilMask);
+        float density = clamp((macro - (1.0 - billow) * erosionStrength) / (1.0 - erosionStrength * 0.78), 0.0, 1.0);
+
+        if (h > 11.6) {
+          float cirrusVal = texture2D(uCirrus, pos.xz * 0.014).a;
+          density *= mix(1.0, 0.42 + 0.58 * cirrusVal, smoothstep(12.0, 14.8, h));
+        }
+        if (density < 0.003) {
+          outTauSun = 0.0;
+          return 0.0;
+        }
+
+        // High-Contrast Smooth Directional 3D Self-Shadowing:
+        // Bright sunlit cauliflower crowns + deep shadowed crevices, anvil overhang, and dark storm base
+        if (macroStorm > macroRegional) {
+          vec3 stormNormal = normalize(vec3(dx - 4.0, (h - 7.8) * 1.45, dz));
+          float sunFacing = dot(stormNormal, lightDir);
+
+          float billowSun  = sampleNoise3D(pNoise + lightDir * 0.13).g;
+          float puffCrevice = max(0.0, billowSun - nMacro.g + 0.12) * 3.2 + (1.0 - billow) * 0.75;
+
+          float leeShadow = smoothstep(0.40, -0.45, sunFacing) * 2.8;
+          float deepCore  = smoothstep(0.68, 0.96, macroStorm) * 2.4;
+
+          vec2 sunOff = vec2(dx, dz) + lightDir.xz * 5.0;
+          float underAnvil = (1.0 - smoothstep(9.5, 12.6, h))
+                           * smoothstep(25.0, 8.0, length(sunOff - vec2(8.0, 0.5))) * 1.75;
+          float darkBase   = (1.0 - smoothstep(1.5, 4.2, h)) * 2.4;
+
+          outTauSun = puffCrevice + leeShadow + deepCore + underAnvil + darkBase;
+        } else {
+          float nSun = sampleNoise3D(pNoise + lightDir * 0.12).g;
+          float creviceTau = max(0.0, nSun - nMacro.g + 0.12) * 2.6 + (1.0 - nMacro.g) * 0.45;
+          float dhTop = max(0.0, topAlt - h);
+          float baseDarkening = smoothstep(0.35, 1.85, dhTop) * 2.1;
+          outTauSun = baseDarkening + creviceTau;
         }
 
         return density;
       }
 
-      // 4. Optical Thickness March toward celestial light
-      float lightMarch(vec3 pos, vec3 lightDir) {
-        float tau = 0.0;
-        tau += evalCloudDensity(pos + lightDir * 1.5) * 1.5;
-        tau += evalCloudDensity(pos + lightDir * 4.2) * 2.7;
-        tau += evalCloudDensity(pos + lightDir * 9.5) * 5.3;
-        tau += evalCloudDensity(pos + lightDir * 21.0) * 11.5;
-        return tau;
-      }
-
-      // Dual-lobe Henyey-Greenstein phase function for Silver Lining & backscatter
       float hg(float cosT, float g) {
         float g2 = g * g;
         return (1.0 - g2) / (4.0 * PI * pow(max(1e-4, 1.0 + g2 - 2.0 * g * cosT), 1.5));
@@ -309,131 +324,249 @@ export function createRealisticClouds(initialDistKm = 130, bakes = null) {
       void main() {
         #include <logdepthbuf_fragment>
 
+        // Smart Altitude Unloading: planetary cloud layer takes over completely above 88 km
+        if (uCamAlt > 88.0) discard;
+
         vec3 earthCenter = vec3(0.0, -R_EARTH, 0.0);
         vec3 p0 = cameraPosition - earthCenter;
         float camR = length(p0);
 
-        // Discard opposing shell faces so raymarching executes exactly once per pixel
         bool isOutside = camR > R_TOP;
         if (isOutside && !gl_FrontFacing) discard;
         if (!isOutside && gl_FrontFacing) discard;
 
         vec3 rd = normalize(vRayDir);
 
-        vec2 hit1 = intersectSphere(p0, rd, R_BASE);
-        vec2 hit2 = intersectSphere(p0, rd, R_TOP);
+        // 1. Tight Supercell 3D Bounding Sphere (radius 34 km around storm center -> small dt, zero stipple!)
+        float stormDrop = (uStormDistKm * uStormDistKm) / (2.0 * R_EARTH);
+        vec3 stormCenter = vec3(6.0, 9.0 - stormDrop, -uStormDistKm);
+        vec2 hitStorm = intersectSphere(cameraPosition - stormCenter, rd, 34.0);
+
+        // 2. Intersect low Regional Cumulus Slab [R_BASE .. R_REG_TOP] and full Troposphere [R_BASE .. R_TOP]
+        vec2 hitBase  = intersectSphere(p0, rd, R_BASE);
+        vec2 hitReg   = intersectSphere(p0, rd, R_REG_TOP);
+        vec2 hitTop   = intersectSphere(p0, rd, R_TOP);
         vec2 hitEarth = intersectSphere(p0, rd, R_EARTH);
 
-        float tNear = 0.0;
-        float tFar  = 0.0;
-
+        float tRegNear = 0.0, tRegFar = -1.0;
         if (camR < R_BASE) {
-          // Coastal ground observer (POV at 25m)
-          if (hit1.y <= 0.0) discard;
-          tNear = max(0.0, hit1.y);
-          tFar  = hit2.y;
-        } else if (camR > R_TOP) {
-          // Space or orbital observer (> 17.5 km)
-          if (hit2.x <= 0.0 && hit2.y <= 0.0) discard;
-          tNear = max(0.0, hit2.x);
-          if (hitEarth.x > 0.0) {
-            tFar = hitEarth.x;
-          } else {
-            tFar = hit2.y;
+          if (hitBase.y > 0.0) {
+            tRegNear = max(0.0, hitBase.y);
+            tRegFar  = min(hitReg.y, tRegNear + 24.0);
+          }
+        } else if (camR > R_REG_TOP) {
+          if (hitReg.x > 0.0 || hitReg.y > 0.0) {
+            tRegNear = max(0.0, hitReg.x);
+            float rawEnd = (hitEarth.x > 0.0) ? min(hitReg.y, hitEarth.x) : hitReg.y;
+            tRegFar = min(rawEnd, tRegNear + 28.0);
           }
         } else {
-          // Inside cloud layer (1.2 to 17.5 km)
-          tNear = 0.0;
-          tFar  = hit2.y;
-          if (hitEarth.x > 0.0) {
-            tFar = min(tFar, hitEarth.x);
-          }
+          tRegNear = 0.0;
+          float rawEnd = (hitEarth.x > 0.0) ? min(hitReg.y, hitEarth.x) : hitReg.y;
+          tRegFar = min(rawEnd, 24.0);
+        }
+        bool hasReg = (tRegFar > tRegNear);
+        if (hasReg) {
+          vec3 pRegEntry = cameraPosition + rd * tRegNear;
+          if (length(pRegEntry.xz) > 215.0) hasReg = false;
         }
 
-        if (tFar <= tNear || tNear < 0.0) discard;
-        tFar = min(tFar, tNear + 140.0);
-
-        // Raymarching setup with 44 steps and Interleaved Gradient Noise spatial jittering
-        const int NUM_STEPS = 44;
-        float dt = (tFar - tNear) / float(NUM_STEPS);
-        float jitter = ign(gl_FragCoord.xy);
-        float t = tNear + dt * jitter;
-
-        vec3 lightDir = normalize(uSunDir);
-        vec3 lightCol = uSunTint * (uSunIrradiance / PI);
-        if (dot(uSunDir, vec3(0.0, 1.0, 0.0)) < -0.10) {
-          lightDir = normalize(uMoonDir);
-          lightCol = uMoonTint * (uMoonIrradiance / PI);
+        float tShellNear = 0.0, tShellFar = -1.0;
+        if (camR < R_BASE) {
+          tShellNear = max(0.0, hitBase.y);
+          tShellFar  = hitTop.y;
+        } else if (camR > R_TOP) {
+          tShellNear = max(0.0, hitTop.x);
+          tShellFar  = (hitEarth.x > 0.0) ? min(hitTop.y, hitEarth.x) : hitTop.y;
+        } else {
+          tShellNear = 0.0;
+          tShellFar  = (hitEarth.x > 0.0) ? min(hitTop.y, hitEarth.x) : hitTop.y;
         }
 
+        float tStormNear = max(tShellNear, max(0.0, hitStorm.x));
+        float tStormFar  = min(tShellFar, hitStorm.y);
+        bool hitsSupercell = (hitStorm.y > 0.0 && tStormFar > tStormNear + 0.05);
+
+        if (!hasReg && !hitsSupercell) discard;
+
+        // Balanced Blue-Noise IGN jitter (eliminates discrete step shells without graininess)
+        float jitter = (ign(gl_FragCoord.xy) - 0.5) * 0.72 + 0.5;
+
+        bool isNight = (dot(uSunDir, vec3(0.0, 1.0, 0.0)) < -0.08);
+        vec3 lightDir = isNight ? normalize(uMoonDir) : normalize(uSunDir);
         float cosTheta = dot(rd, lightDir);
-        // Phase function scaled by 4*PI so isotropic average is 1.0 (matching direct irradiance)
-        float phase = mix(hg(cosTheta, 0.72), hg(cosTheta, -0.25), 0.35) * (4.0 * PI);
 
-        vec3 skyAmbient = vec3(0.52, 0.68, 0.88) * 0.45;
-        vec3 groundAmbient = vec3(0.18, 0.28, 0.38) * 0.30;
+        // Energy-conserving base phase function (no nuclear forward blowout!)
+        float basePhase = 0.65 + 0.35 * hg(cosTheta, -0.22) * (4.0 * PI);
+        float rawSilver = min(hg(cosTheta, 0.74) * (4.0 * PI), 4.6);
 
         vec3 accumCol = vec3(0.0);
         float accumTransmittance = 1.0;
         float firstHitDist = -1.0;
 
-        for (int i = 0; i < NUM_STEPS; i++) {
-          if (t >= tFar) break;
-          vec3 p = cameraPosition + rd * t;
-          float density = evalCloudDensity(p);
+        // Determine front-to-back segments based on whether camera is below or above the regional cloud tops
+        bool doSeg1 = false;
+        float s1Near = 0.0, s1Far = 0.0;
+        bool doSeg2 = false;
+        float s2Near = 0.0, s2Far = 0.0;
 
-          if (density > 0.003) {
-            if (firstHitDist < 0.0) {
-              firstHitDist = t;
-            }
-
-            // Light march with physical Beer-Lambert and multiple scattering
-            float tau = lightMarch(p, lightDir);
-            float beer = exp(-tau * 0.28);
-            float shadow = max(beer, exp(-tau * 0.08) * 0.32);
-
-            // Internal lightning flash illumination
-            vec3 flashCol = vec3(0.0);
-            if (uStormFlash > 0.01) {
-              for (int k = 0; k < 4; k++) {
-                if (uFlashInt[k] > 0.05) {
-                  vec3 toFlash = uFlashPos[k] - p;
-                  float d2 = dot(toFlash, toFlash);
-                  flashCol += vec3(0.70, 0.84, 1.0) * (uFlashInt[k] / (d2 + 9.0)) * 2.2;
-                }
-              }
-            }
-
-            vec3 upVec = normalize(p - earthCenter);
-            float ambFactor = clamp(dot(upVec, lightDir) * 0.5 + 0.5, 0.0, 1.0);
-            vec3 amb = mix(groundAmbient, skyAmbient, ambFactor);
-
-            vec3 stepLight = lightCol * shadow * phase + amb * (0.35 + 0.65 * beer) + flashCol;
-            float stepExtinction = density * 0.28;
-            float stepTrans = exp(-stepExtinction * dt);
-
-            vec3 integLight = stepLight * (1.0 - stepTrans);
-            accumCol += integLight * accumTransmittance;
-            accumTransmittance *= stepTrans;
-
-            if (accumTransmittance < 0.01) {
-              break;
-            }
+        if (camR <= R_REG_TOP) {
+          if (hasReg) {
+            s1Near = tRegNear;
+            s1Far  = hitsSupercell ? min(tRegFar, tStormNear) : tRegFar;
+            doSeg1 = (s1Far > s1Near + 0.05);
           }
-
-          t += dt;
+          if (hitsSupercell) {
+            s2Near = hasReg ? max(tStormNear, s1Far) : tStormNear;
+            s2Far  = min(tStormFar, s2Near + 48.0);
+            doSeg2 = (s2Far > s2Near + 0.05);
+          }
+        } else {
+          if (!hitsSupercell) {
+            s1Near = tRegNear;
+            s1Far  = tRegFar;
+            doSeg1 = hasReg;
+          } else {
+            float stormChord = clamp((tStormFar - tStormNear) / 16.0, 0.0, 1.0);
+            s2Near = hasReg ? mix(tRegNear, min(tRegNear, tStormNear), stormChord) : tStormNear;
+            s2Far  = hasReg ? mix(tRegFar,  max(tRegFar,  tStormFar),  stormChord) : tStormFar;
+            s2Far  = min(s2Far, s2Near + 52.0);
+            doSeg2 = (s2Far > s2Near + 0.05);
+          }
         }
 
-        float accumAlpha = 1.0 - accumTransmittance;
+        if (!doSeg1 && !doSeg2) discard;
+        float tNear = doSeg1 ? s1Near : s2Near;
+
+        // Segment 1: Tight Regional Cumulus Slab (14 steps)
+        if (doSeg1) {
+          float dtReg = (s1Far - s1Near) / 14.0;
+          float t = s1Near + dtReg * jitter;
+          for (int i = 0; i < 14; i++) {
+            vec3 p = cameraPosition + rd * t;
+            float r = length(p - earthCenter);
+            float h = r - R_EARTH;
+
+            float tau = 0.0;
+            float density = evalRegionalDensity(p, h, tau, lightDir);
+
+            if (density > 0.003) {
+              if (firstHitDist < 0.0) firstHitDist = t;
+              vec3 upVec = (p - earthCenter) / r;
+              float muL = dot(upVec, lightDir);
+
+              vec3 directLight = isNight
+                ? sunTransmittance(h, max(muL, 0.05)) * (uMoonIrradiance / PI) * uMoonTint
+                : sunTransmittance(h, max(muL, -0.04)) * (uSunIrradiance / PI) * uSunTint * smoothstep(-0.06, 0.06, muL);
+
+              float shadow = max(exp(-tau * 0.45), exp(-tau * 0.15) * 0.22);
+              float rimMask = accumTransmittance * exp(-tau * 1.45) * (1.0 - smoothstep(0.32, 0.80, density));
+              float phase = basePhase + rawSilver * rimMask;
+
+              float dayAmbScale = isNight ? 0.03 : clamp(muL * 1.8 + 0.15, 0.05, 1.0);
+              float sunsetWarmth = isNight ? 0.0 : exp(-pow((muL - 0.02) / 0.08, 2.0));
+              vec3 skyAmb = mix(vec3(0.32, 0.46, 0.68), vec3(0.52, 0.28, 0.18), sunsetWarmth * 0.75) * dayAmbScale;
+              vec3 gndAmb = mix(vec3(0.10, 0.18, 0.28), vec3(0.24, 0.12, 0.08), sunsetWarmth * 0.70) * dayAmbScale;
+              float hFrac = clamp((h - 1.4) / 12.0, 0.0, 1.0);
+              vec3 amb = mix(gndAmb, skyAmb, 0.35 + 0.65 * hFrac) * (0.28 + 0.72 * exp(-tau * 0.22));
+
+              vec3 stepLight = directLight * shadow * phase + amb;
+              float stepExtinction = density * 0.62 * smoothstep(0.0, 0.15, density);
+              float stepTrans = exp(-stepExtinction * dtReg);
+
+              accumCol += stepLight * (1.0 - stepTrans) * accumTransmittance;
+              accumTransmittance *= stepTrans;
+              if (accumTransmittance < 0.008) {
+                accumTransmittance = 0.0;
+                break;
+              }
+            }
+            t += dtReg;
+          }
+        }
+
+        // Segment 2: Tight Supercell Bounding Sphere (26 steps)
+        if (doSeg2 && accumTransmittance > 0.008) {
+          float dtStorm = (s2Far - s2Near) / 26.0;
+          float t = s2Near + dtStorm * jitter;
+          for (int i = 0; i < 26; i++) {
+            vec3 p = cameraPosition + rd * t;
+            float r = length(p - earthCenter);
+            float h = r - R_EARTH;
+
+            float tau = 0.0;
+            float density = evalFullCloudDensity(p, h, tau, lightDir);
+
+            if (density > 0.003) {
+              if (firstHitDist < 0.0) firstHitDist = t;
+              vec3 upVec = (p - earthCenter) / r;
+              float muL = dot(upVec, lightDir);
+
+              vec3 directLight = isNight
+                ? sunTransmittance(h, max(muL, 0.05)) * (uMoonIrradiance / PI) * uMoonTint
+                : sunTransmittance(h, max(muL, -0.04)) * (uSunIrradiance / PI) * uSunTint * smoothstep(-0.06, 0.06, muL);
+
+              float shadow = max(exp(-tau * 0.45), exp(-tau * 0.15) * 0.22);
+              float rimMask = accumTransmittance * exp(-tau * 1.45) * (1.0 - smoothstep(0.32, 0.80, density));
+              float phase = basePhase + rawSilver * rimMask;
+
+              vec3 flashCol = vec3(0.0);
+              if (uStormFlash > 0.01) {
+                for (int k = 0; k < 4; k++) {
+                  if (uFlashInt[k] > 0.05) {
+                    vec3 toFlash = uFlashPos[k] - p;
+                    flashCol += vec3(0.70, 0.84, 1.0) * (uFlashInt[k] / (dot(toFlash, toFlash) + 9.0)) * 2.2;
+                  }
+                }
+              }
+
+              float dayAmbScale = isNight ? 0.03 : clamp(muL * 1.8 + 0.15, 0.05, 1.0);
+              float sunsetWarmth = isNight ? 0.0 : exp(-pow((muL - 0.02) / 0.08, 2.0));
+              vec3 skyAmb = mix(vec3(0.32, 0.46, 0.68), vec3(0.52, 0.28, 0.18), sunsetWarmth * 0.75) * dayAmbScale;
+              vec3 gndAmb = mix(vec3(0.10, 0.18, 0.28), vec3(0.24, 0.12, 0.08), sunsetWarmth * 0.70) * dayAmbScale;
+              float hFrac = clamp((h - 1.4) / 12.0, 0.0, 1.0);
+              vec3 amb = mix(gndAmb, skyAmb, 0.35 + 0.65 * hFrac) * (0.28 + 0.72 * exp(-tau * 0.22));
+
+              vec3 stepLight = directLight * shadow * phase + amb + flashCol;
+              float stepExtinction = density * 0.62 * smoothstep(0.0, 0.15, density);
+              float stepTrans = exp(-stepExtinction * dtStorm);
+
+              accumCol += stepLight * (1.0 - stepTrans) * accumTransmittance;
+              accumTransmittance *= stepTrans;
+              if (accumTransmittance < 0.008) {
+                accumTransmittance = 0.0;
+                break;
+              }
+            }
+            t += dtStorm;
+          }
+        }
+
+        // Solidify core opacity so dense storm/cumulus cores block 100% of the solar disk behind them
+        float rawAlpha = 1.0 - accumTransmittance;
+        if (rawAlpha < 0.004) discard;
+
+        // Even a thin cloud layer blocks the sharp direct solar disk (e^(-tau_beam) -> 0)
+        float solarDiskBlock = smoothstep(0.996, 0.9995, cosTheta) * smoothstep(0.04, 0.25, rawAlpha);
+        float accumAlpha = max(smoothstep(0.0, 0.86, rawAlpha), solarDiskBlock);
+
+        // Seamless spatial & altitude cross-fade into the pre-baked Planetary Cloud Layer in planet.js
+        vec3 pHit = cameraPosition + rd * (firstHitDist > 0.0 ? firstHitDist : tNear);
+        float horizDist = length(pHit.xz);
+        float domainFade = (1.0 - smoothstep(140.0, 210.0, horizDist)) * (1.0 - smoothstep(48.0, 88.0, uCamAlt));
+        accumAlpha *= domainFade;
         if (accumAlpha < 0.004) discard;
+
+        // Un-premultiply cloud scattered light so NormalBlending does not double-darken cloud edges
+        vec3 cloudRadiance = accumCol / max(rawAlpha, 1e-4);
 
         // Aerial perspective in-scattering & transmittance
         vec3 localSunDir = getSunDirAt(uCamPos);
         Atmo atmo = atmosphereMarch(uCamAlt, uCamUp, rd, localSunDir, firstHitDist > 0.0 ? firstHitDist : tNear, 4);
-        vec3 finalCol = accumCol * atmo.transmittance + atmo.inscatter * accumAlpha;
+        vec3 finalCol = cloudRadiance * atmo.transmittance + atmo.inscatter;
 
-        // Soft HDR compression to prevent glare
-        finalCol = finalCol / (1.0 + finalCol * 0.28);
+        // Soft HDR shoulder (k=0.62 caps max radiance at 1.61 < 1.85 bloom threshold, preventing any blurry sun glare!)
+        finalCol = finalCol / (1.0 + finalCol * 0.62);
 
         gl_FragColor = vec4(finalCol, accumAlpha);
       }
@@ -631,6 +764,15 @@ export function createRealisticClouds(initialDistKm = 130, bakes = null) {
 
   function update(delta) {
     cloudUniforms.uTime.value += delta;
+
+    // Smart CPU-level unloading: completely skip rendering the local 3D volumetric shell
+    // and rain shafts when in orbit (> 88 km) or far outside the local domain (> 320 km)
+    const camAlt = atmosphereUniforms.uCamAlt.value;
+    const camPos = atmosphereUniforms.uCamPos.value;
+    const camHorizDist = Math.hypot(camPos.x, camPos.z);
+    cloudShellMesh.visible = (camAlt < 89.0 && camHorizDist < 320.0);
+    rainMesh.visible = (camAlt < 42.0 && camHorizDist < 210.0);
+
     for (let i = 0; i < 4; i++) {
       flashIntensities[i] *= Math.exp(-delta / 0.09);
     }

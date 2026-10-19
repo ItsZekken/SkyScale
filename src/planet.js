@@ -363,6 +363,7 @@ export function createPlanet(bakes = {}) {
     uEarthRadius: { value: EARTH_RADIUS },
     uGeoGlobal: { value: bakes.earthGlobal || null },
     uGeoRegional: { value: bakes.earthRegional || null },
+    uPlanetaryClouds: { value: bakes.planetaryClouds || null },
     uRegion: { value: new THREE.Vector4(-84.0, 4.0, -66.0, 18.0) },
     uCityLightsMap: { value: bakes.cityLights || null },
     uOceanNormalMap: { value: bakes.oceanNormal || null },
@@ -424,6 +425,7 @@ export function createPlanet(bakes = {}) {
       uniform float uEarthRadius;
       uniform sampler2D uGeoGlobal;
       uniform sampler2D uGeoRegional;
+      uniform sampler2D uPlanetaryClouds;
       uniform vec4 uRegion;
       uniform sampler2D uCityLightsMap;
       uniform sampler2D uOceanNormalMap;
@@ -626,6 +628,48 @@ export function createPlanet(bakes = {}) {
           landColor += texture2D(uCityLightsMap, uvG).rgb * vec3(1.0, 0.64, 0.24) * cityMask * localNight * 1.65;
 
           surf = mix(surf, landColor, land);
+        }
+
+        // Pre-baked Scientific Planetary Cloud Layer (ITCZ, Coriolis Cyclones, Curl Advection & Orographic Clouds)
+        // Smoothly takes over outside the local 3D raymarcher domain (r > 135..205 km) and when ascending to space (alt > 45..86 km)
+        float planetaryMask = mix(smoothstep(135.0, 205.0, distFromOrigin), 1.0, smoothstep(45.0, 86.0, uCamAlt));
+        if (planetaryMask > 0.001) {
+          vec3 eastG  = normalize(vec3(-g.z, 0.0, -g.x) + vec3(1e-6, 0.0, 0.0));
+          vec3 northG = normalize(cross(g, eastG));
+          vec3 sunG   = uGeoMatrix * localSunDir;
+          vec2 sunHoriz = vec2(dot(sunG, eastG), dot(sunG, northG));
+
+          // 1. Cast physical cloud shadows onto ocean & continents
+          vec2 shadowUv = uvG + sunHoriz * vec2(0.0015, 0.0026) * clamp(1.0 / max(muS, 0.22), 1.0, 3.2);
+          float cShadow = texture2D(uPlanetaryClouds, shadowUv).r * planetaryMask * smoothstep(0.01, 0.22, muS);
+          surf *= (1.0 - cShadow * 0.68);
+
+          // 2. Sample pre-computed planetary cloud density (R), top altitude (G), and optical gradients (B, A)
+          vec4 pc = texture2D(uPlanetaryClouds, uvG);
+          float subDetail = (fbm3(P / 13.5, 2) * 0.5 + 0.5) * smoothstep(pixKm * 1.5, pixKm * 8.0, 13.5) + 0.5 * (1.0 - smoothstep(pixKm * 1.5, pixKm * 8.0, 13.5));
+          float cDens = smoothstep(0.05, 0.86, pc.r * (0.80 + 0.34 * subDetail)) * planetaryMask;
+
+          if (cDens > 0.002) {
+            vec2 cGrad = (pc.ba - 0.5) * 2.0;
+            float sunSlope = -(cGrad.x * sunHoriz.x + cGrad.y * sunHoriz.y);
+            float selfShadow = clamp(0.58 + sunSlope * 0.78, 0.14, 1.22);
+
+            float cTopKm = mix(2.2, 15.0, pc.g);
+            vec3 cSunLight = sunTransmittance(cTopKm, max(muS, -0.05)) * uSunIrradiance * uSunTint * smoothstep(-0.07, 0.08, muS);
+            float VdotS = max(0.0, dot(-V, localSunDir));
+            float rimSilver = pow(VdotS, 6.0) * cDens * (1.0 - cDens * 0.82) * 1.45;
+
+            vec3 cLit = (vec3(0.95, 0.96, 0.98) / PI) * (
+              cSunLight * (selfShadow + rimSilver) +
+              moonCol * max(0.0, muM) * 0.85 +
+              skyAmb * (0.45 + 0.42 * pc.g)
+            );
+            // Soft HDR shoulder so planetary clouds never trigger bloom
+            cLit = cLit / (1.0 + cLit * 0.62);
+
+            float cAlpha = clamp(1.0 - exp(-cDens * 3.5), 0.0, 0.98);
+            surf = mix(surf, cLit, cAlpha);
+          }
         }
 
         float orbitBlend = smoothstep(12.0, 65.0, uCamAlt);

@@ -446,6 +446,8 @@ async function init() {
     updateCurvatureUI();
     hideLoadingOverlay();
 
+    window.__skyScale = { tour, camCtrl, camera, state, setTimeOfDay, setViewMode, clouds, planet };
+
     let lastTime = performance.now();
     function animate() {
       requestAnimationFrame(animate);
@@ -453,13 +455,13 @@ async function init() {
       const delta = Math.min((now - lastTime) / 1000, 0.1);
       lastTime = now;
 
+      camCtrl.update();
+      if (planet) planet.update(delta, camera, state.timeOfDay === 'midnight' ? 1.0 : (state.timeOfDay === 'sunset' ? 0.35 : 0.0));
       if (clouds) clouds.update(delta);
       if (lightning) lightning.update(delta);
       if (sprites) sprites.update(delta);
       if (scaleRefs) scaleRefs.update(delta, camera, state.viewMode);
-      if (planet) planet.update(delta, camera, state.timeOfDay === 'midnight' ? 1.0 : (state.timeOfDay === 'sunset' ? 0.35 : 0.0));
 
-      camCtrl.update();
       composer.render();
     }
     animate();

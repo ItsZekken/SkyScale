@@ -248,8 +248,8 @@ Atmo atmosphereMarch(float camAlt, vec3 camUp, vec3 rd, vec3 sunDir, float tMax,
   vec3 rawLunar = sumMoonS * uMoonTint * uSkyGain;
   vec3 rawInscatter = rawSolar + rawLunar + sumNight;
 
-  // Controlled soft HDR shoulder prevents blinding white blowout near the solar disk
-  res.inscatter = rawInscatter / (1.0 + rawInscatter * 0.28);
+  // Controlled soft HDR shoulder keeps atmospheric scattering strictly below the 1.85 bloom threshold
+  res.inscatter = rawInscatter / (1.0 + rawInscatter * 0.62);
   res.transmittance = T;
   return res;
 }
@@ -272,7 +272,7 @@ vec3 sunDisk(vec3 rd){
   if (x >= 1.0) return vec3(0.0);
   float limb = 1.0 - 0.6 * (1.0 - sqrt(max(0.0, 1.0 - x)));
   vec3 T = spaceAwareTransmittance(uCamAlt, uCamUp, rd);
-  return min(uSunDiskRadiance * limb * uSunTint * T, vec3(3.2));
+  return min(uSunDiskRadiance * limb * uSunTint * T, vec3(2.15));
 }
 
 float moonHash(vec3 p){

@@ -114,8 +114,9 @@ float evaluateMassifs(float lat, float lon, float coastSdf) {
 
     float rad = radians(massifs[i].angDeg);
     float cosA = cos(rad), sinA = sin(rad);
-    float xRot = dLonKm * cosA + dLatKm * sinA;
-    float yRot = -dLonKm * sinA + dLatKm * cosA;
+    vec2 wMtn = warp2(vec2(dLonKm, dLatKm) * 0.012 + float(i) * 1.7, 0.45, 1.1);
+    float xRot = dLonKm * cosA + dLatKm * sinA + wMtn.x * 22.0;
+    float yRot = -dLonKm * sinA + dLatKm * cosA + wMtn.y * 28.0;
 
     float dist2 = (xRot * xRot) / (massifs[i].rxKm * massifs[i].rxKm) + (yRot * yRot) / (massifs[i].ryKm * massifs[i].ryKm);
     if (dist2 < 9.0) {
@@ -123,7 +124,7 @@ float evaluateMassifs(float lat, float lon, float coastSdf) {
       vec2 wCoord = warp2(vec2(dLonKm, dLatKm) * 0.06, 0.45, 1.1);
       float rid = ridged2(wCoord * 2.2, 5);
       float fineRid = ridged2(vec2(dLonKm, dLatKm) * 0.35, 3);
-      totalMtn += massifs[i].peakKm * gauss * (0.42 + 0.45 * rid + 0.18 * fineRid);
+      totalMtn += massifs[i].peakKm * gauss * (0.32 + 0.52 * rid + 0.20 * fineRid);
     }
   }
   return totalMtn;
@@ -273,38 +274,84 @@ void main(){
 }
 `;
 
-const WEATHER_MAP_FRAG = /* glsl */`
+// 512x512 Packed 3D Volume Noise Atlas (64x64x64 voxels in 8x8 slices)
+// Pre-calculates 3D tileable billow + FBM + fibrous erosion so the raymarcher
+// evaluates 3D turbulence in 1 hardware texture fetch instead of 40 ALU hashes!
+const NOISE_ATLAS_3D_FRAG = /* glsl */`
 varying vec2 vUv;
 ${NOISE_GLSL}
-void main(){
-  // Regional coordinates across 320 km x 320 km Caribbean domain
-  vec2 p = (vUv - 0.5) * 6.0;
-  // Trade winds angle (approx 25 degrees)
-  vec2 pRot = vec2(p.x * 0.90 - p.y * 0.42, p.x * 0.42 + p.y * 0.90);
 
-  // Cloud streets (linear convective bands parallel to trade winds)
-  float streetWave = sin(pRot.y * 12.0) * 0.5 + 0.5;
-  float streetTurb = fbm2(pRot * vec2(2.5, 8.0), 4) * 0.5 + 0.5;
-  float streetMask = smoothstep(0.35, 0.75, streetWave * 0.55 + streetTurb * 0.55);
+float hash13(vec3 p3) {
+  p3 = fract(p3 * 0.1031);
+  p3 += dot(p3, p3.zyx + 31.32);
+  return fract((p3.x + p3.y) * p3.z);
+}
 
-  // Macro regional weather patterns
-  float macroNoise = fbm2(vUv * 4.2 + vec2(3.1, -1.8), 4) * 0.5 + 0.5;
-  float coverage = clamp(macroNoise * 0.65 + streetMask * 0.45 - 0.18, 0.0, 1.0);
+// Periodic 3D value noise normalized to full [-1, +1] contrast
+float vnoise3Periodic(vec3 x, float period) {
+  vec3 i = floor(x);
+  vec3 f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  vec3 i0 = mod(i, period);
+  vec3 i1 = mod(i + 1.0, period);
+  float v = mix(
+    mix(mix(hash13(vec3(i0.x, i0.y, i0.z)), hash13(vec3(i1.x, i0.y, i0.z)), f.x),
+        mix(hash13(vec3(i0.x, i1.y, i0.z)), hash13(vec3(i1.x, i1.y, i0.z)), f.x), f.y),
+    mix(mix(hash13(vec3(i0.x, i0.y, i1.z)), hash13(vec3(i1.x, i0.y, i1.z)), f.x),
+        mix(hash13(vec3(i0.x, i1.y, i1.z)), hash13(vec3(i1.x, i1.y, i1.z)), f.x), f.y),
+    f.z
+  );
+  return clamp((v - 0.5) * 3.4, -1.0, 1.0);
+}
 
-  // Stratocumulus marine decks over the sea (seaward)
-  float marineDeck = smoothstep(0.2, 0.8, -p.y + fbm2(p * 2.0, 3) * 0.4) * 0.55;
-  coverage = clamp(max(coverage, marineDeck), 0.0, 1.0);
+// True 3D Periodic Inverted Worley Cellular Noise (round cauliflower cumulus puffs!)
+float worley3Periodic(vec3 x, float period) {
+  vec3 id = floor(x);
+  vec3 f = fract(x);
+  float minDist2 = 4.0;
+  for (int dz = -1; dz <= 1; dz++) {
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dx = -1; dx <= 1; dx++) {
+        vec3 offset = vec3(float(dx), float(dy), float(dz));
+        vec3 cell = mod(id + offset, period);
+        vec3 pt = offset + 0.15 + 0.70 * hash33(cell);
+        vec3 diff = pt - f;
+        minDist2 = min(minDist2, dot(diff, diff));
+      }
+    }
+  }
+  return clamp(1.0 - sqrt(minDist2) * 1.08, 0.0, 1.0);
+}
 
-  // Base altitude: Marine LCL level 1.8 km to 2.2 km
-  float baseAlt = 1.85 + 0.35 * fbm2(p * 1.5, 2);
+void main() {
+  vec2 pix = floor(vUv * 512.0);
+  float sliceX = floor(pix.x / 64.0);
+  float sliceY = floor(pix.y / 64.0);
+  float zIdx = sliceY * 8.0 + sliceX;
+  // Dividing X/Y by 63.0 ensures texel 0 (0.0) and texel 63 (1.0) match periodically with zero slice bleed!
+  vec3 uvw = vec3(mod(pix.x, 64.0) / 63.0, mod(pix.y, 64.0) / 63.0, zIdx / 64.0);
 
-  // Top altitude: 3.0 km for humilis, up to 7.5 km for congestus
-  float topAlt = baseAlt + 1.2 + coverage * 4.2;
+  // R: Macro Worley-Perlin lobes (periodic at 4, 8)
+  float w4  = worley3Periodic(uvw * 4.0, 4.0);
+  float w8  = worley3Periodic(uvw * 8.0 + vec3(1.7, 3.2, 5.1), 8.0);
+  float p4  = vnoise3Periodic(uvw * 4.0 + 2.3, 4.0) * 0.5 + 0.5;
+  float rLobe = smoothstep(0.14, 0.86, w4 * 0.48 + w8 * 0.32 + p4 * 0.20);
 
-  // Cloud type: 0.15 cumulus humilis, 0.5 stratocumulus, 0.85 congestus
-  float cloudType = mix(0.15, 0.85, coverage);
+  // G: Crisp multi-octave Cauliflower Worley-Billow puffs (periodic at 6, 12, 24)
+  float c1 = worley3Periodic(uvw * 6.0 + vec3(3.1, 5.4, 2.7), 6.0);
+  float c2 = worley3Periodic(uvw * 12.0 + vec3(7.8, 2.1, 4.3), 12.0);
+  float c3 = 1.0 - abs(vnoise3Periodic(uvw * 24.0 + vec3(6.4, 4.9, 8.1), 24.0));
+  float gBillow = smoothstep(0.16, 0.84, c1 * 0.50 + c2 * 0.32 + c3 * 0.18);
 
-  gl_FragColor = vec4(coverage, baseAlt / 10.0, topAlt / 10.0, cloudType);
+  // B: Fine turbulent erosion & wispy anvil detail
+  float f1 = worley3Periodic(uvw * 16.0 + vec3(4.1, 8.3, 2.6), 16.0);
+  float f2 = 1.0 - abs(vnoise3Periodic(uvw * 32.0 + vec3(1.9, 5.5, 9.4), 32.0));
+  float bWisp = smoothstep(0.15, 0.85, f1 * 0.55 + f2 * 0.45);
+
+  // A: Ready-to-use high-contrast composite erosion field
+  float aComp = smoothstep(0.15, 0.85, rLobe * 0.44 + gBillow * 0.36 + bWisp * 0.20);
+
+  gl_FragColor = vec4(rLobe, gBillow, bWisp, aComp);
 }
 `;
 
@@ -322,6 +369,29 @@ void main(){
 }
 `;
 
+function loadPrebakedTexture(url, renderer, { wrapS = THREE.ClampToEdgeWrapping, wrapT = THREE.ClampToEdgeWrapping, mipmaps = true } = {}) {
+  return new Promise((resolve, reject) => {
+    const loader = new THREE.TextureLoader();
+    loader.load(
+      url,
+      (tex) => {
+        tex.flipY = true; // Matches encodeRGBAtoPNG (top of PNG = North +90 deg)
+        tex.colorSpace = THREE.NoColorSpace;
+        tex.wrapS = wrapS;
+        tex.wrapT = wrapT;
+        tex.generateMipmaps = mipmaps;
+        tex.minFilter = mipmaps ? THREE.LinearMipmapLinearFilter : THREE.LinearFilter;
+        tex.magFilter = THREE.LinearFilter;
+        tex.anisotropy = Math.min(8, renderer.capabilities.getMaxAnisotropy());
+        tex.needsUpdate = true;
+        resolve(tex);
+      },
+      undefined,
+      (err) => reject(err)
+    );
+  });
+}
+
 export async function bakeAll(renderer, onProgress = () => {}) {
   const nextTick = () => new Promise(r => setTimeout(r, 0));
 
@@ -335,18 +405,32 @@ export async function bakeAll(renderer, onProgress = () => {}) {
     anisotropy: 1
   });
 
-  onProgress(0.25, 'Horneando mapa meteorológico regional (1024²)...');
+  onProgress(0.25, 'Cargando mapas meteorológicos planetarios pre-calculados...');
+  const [planetaryClouds, cloudAtlas] = await Promise.all([
+    loadPrebakedTexture('/planetary-clouds.png', renderer, {
+      wrapS: THREE.RepeatWrapping,
+      wrapT: THREE.ClampToEdgeWrapping,
+      mipmaps: true
+    }),
+    loadPrebakedTexture('/regional-weather.png', renderer, {
+      wrapS: THREE.ClampToEdgeWrapping,
+      wrapT: THREE.ClampToEdgeWrapping,
+      mipmaps: false
+    })
+  ]);
+
+  onProgress(0.35, 'Horneando Atlas Volumétrico 3D (64³)...');
   await nextTick();
-  const cloudAtlas = bakeToTexture(renderer, {
-    width: 1024,
-    height: 1024,
-    fragmentShader: WEATHER_MAP_FRAG,
+  const noiseAtlas = bakeToTexture(renderer, {
+    width: 512,
+    height: 512,
+    fragmentShader: NOISE_ATLAS_3D_FRAG,
     wrap: THREE.RepeatWrapping,
-    mipmaps: true,
-    anisotropy: 8
+    mipmaps: false,
+    anisotropy: 1
   });
 
-  onProgress(0.40, 'Horneando filamentos de cirros (1024²)...');
+  onProgress(0.45, 'Horneando filamentos de cirros (1024²)...');
   await nextTick();
   const cirrus = bakeToTexture(renderer, {
     width: 1024,
@@ -356,7 +440,7 @@ export async function bakeAll(renderer, onProgress = () => {}) {
     anisotropy: 4
   });
 
-  onProgress(0.50, 'Horneando terreno satelital (1024²)...');
+  onProgress(0.55, 'Horneando terreno satelital (1024²)...');
   await nextTick();
   const terrain = bakeToTexture(renderer, {
     width: 1024,
@@ -366,7 +450,7 @@ export async function bakeAll(renderer, onProgress = () => {}) {
     anisotropy: 8
   });
 
-  onProgress(0.60, 'Horneando normales oceánicas (1024²)...');
+  onProgress(0.65, 'Horneando normales oceánicas (1024²)...');
   await nextTick();
   const oceanNormal = bakeToTexture(renderer, {
     width: 1024,
@@ -377,7 +461,7 @@ export async function bakeAll(renderer, onProgress = () => {}) {
     anisotropy: 8
   });
 
-  onProgress(0.72, 'Calculando mapas de distancia geodésicos (EDT)...');
+  onProgress(0.75, 'Calculando mapas de distancia geodésicos (EDT)...');
   await nextTick();
   const regBBox = [-84, 4, -66, 18];
   const regMask = rasterizeLand(1024, 768, regBBox, landJson);
@@ -436,7 +520,9 @@ export async function bakeAll(renderer, onProgress = () => {}) {
 
   return {
     transLUT,
+    planetaryClouds,
     cloudAtlas,
+    noiseAtlas,
     cirrus,
     earthGlobal,
     earthRegional,
